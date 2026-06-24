@@ -1,0 +1,58 @@
+# Phase 3 — standalone GRPO loop config (recipe/pie_grpo/train_grpo.py).
+# Plain YAML (loaded with PyYAML), not Hydra: actor_bootstrap.py already takes
+# explicit kwargs, so a flat dict keeps the wiring obvious and dependency-free.
+
+model:
+  # Must match the Pie server's [[model]] hf_repo (weight sync needs identical
+  # architecture + param names). 0.5B fits a full-AdamW actor alongside Pie's
+  # colocated vLLM engine on a single 24GB GPU; scale up on bigger/multi-GPU HW.
+  path: Qwen/Qwen2.5-Coder-0.5B-Instruct
+  # Set to `eager` to force the fallback used when flash_attn is unavailable.
+  # Set to `auto` (or omit the key) to use flash_attention_2 when installed.
+  attn_implementation: auto
+
+actor:
+  lr: 3.0e-6
+  clip_ratio: 0.2
+  entropy_coeff: 0.0
+  ppo_mini_batch_size: 16
+  micro_batch_size_per_gpu: 1
+  max_token_len_per_gpu: 8192
+  master_port: 29512
+  # verl's offload is load-before-step / offload-after-step, so it shrinks the
+  # IDLE footprint, not the optimizer-step PEAK — it can't fix a colocation OOM.
+  # Left off; 0.5B fits without it. (See transformer_impl.py:750-766.)
+  optimizer_offload: false
+  param_offload: false
+  grad_offload: false
+
+rollout:
+  n_samples: 8           # GRPO group size — 8 (was 4) → more MIXED groups (some pass,
+                         # some fail) → fewer zero-advantage steps + cleaner advantages
+  max_tokens: 512        # HumanEval solutions exceed 128
+  temperature: 0.8
+  top_p: 0.95
+  system: "You are a helpful coding assistant. Respond with code only."
+
+pie:
+  uri: ws://127.0.0.1:8080
+  username: rl-trainer
+  grpo_inferlet: grpo@0.1.0
+
+train:
+  num_steps: 100         # real run — long enough for a held-out trend to clear noise
+  max_prompt_len: 512
+  sync_weights: true     # push policy → rollout engine after each step
+
+# HumanEval (prepared by RL-Heval/data/prepare_humaneval.py — 131 train problems).
+data:
+  humaneval_parquet: /home/george/agentic-rl/RL-Heval/data/humaneval_train.parquet
+  problems_per_step: 8   # prompts per GRPO step (× n_samples=4 = 32 generations/step)
+
+# Fixed held-out eval — the clean learning curve (test split, never trained on).
+eval:
+  parquet: /home/george/agentic-rl/RL-Heval/data/humaneval_test.parquet
+  n_problems: null       # null = all held-out problems (~26)
+  every_steps: 5         # eval at baseline, then every N steps + final
+  temperature: 0.0       # greedy pass@1; bump to ~0.2 if Pie's sampler rejects 0
+  top_p: 1.0
