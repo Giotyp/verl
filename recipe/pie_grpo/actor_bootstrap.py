@@ -61,13 +61,24 @@ from recipe.pie_grpo import _flash_attn_compat  # noqa: F401
 
 
 def ensure_dist_ws1(master_addr: str = "127.0.0.1", master_port: int = 29512) -> None:
-    """Populate the env so a single-process ``world_size=1`` group can init.
+    """Seed the env for a single-process group AND bind this rank to its own GPU.
 
     ``TrainingWorker.__init__`` does the actual ``init_process_group`` (reading
     these vars); we only seed them, and only if torch.distributed isn't already
     up. ``setdefault`` means an outer launcher (torchrun, a real multi-GPU job)
-    that already exported these wins — we never clobber a real distributed env.
+    that already exported ``RANK``/``WORLD_SIZE``/``LOCAL_RANK`` wins — we never
+    clobber a real distributed env, so the same path serves WS=1 and torchrun WS>1.
+
+    NOTE: the init path ``TrainingWorker`` takes
+    (``initialize_global_process_group_ray``) does NOT call ``set_device`` —
+    unlike the non-Ray ``initialize_global_process_group``. Under torchrun every
+    rank would then default to ``cuda:0`` and FSDP would pile all ranks onto one
+    GPU (no sharding + the colocation OOM we're escaping). So bind
+    ``LOCAL_RANK -> device`` here, before the process group inits.
     """
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
     if torch.distributed.is_initialized():
         return
     os.environ.setdefault("RANK", "0")
@@ -128,7 +139,10 @@ def _build_configs(
 
     engine_config = FSDPEngineConfig(
         strategy="fsdp",
-        fsdp_size=1,  # WS=1: a formality; no real sharding occurs.
+        # Shard params+grads+optimizer across every rank the launcher gave us:
+        # WS=1 -> a formality (no real sharding); torchrun WS>1 -> the memory win
+        # that lets a >0.5B actor fit alongside a colocated Pie engine.
+        fsdp_size=int(os.environ.get("WORLD_SIZE", "1")),
         model_dtype="bf16",  # rollout/compute dtype.
         # CPU-offload to fit the trainer alongside Pie's colocated vLLM engine.
         # AdamW states (~12GB for 1.5B fp32 m+v) + master copy dwarf the model;

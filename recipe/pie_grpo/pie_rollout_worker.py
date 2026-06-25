@@ -11,8 +11,7 @@ server colocated on the same GPU as the trainer:
   rollout engine via CUDA-IPC handles (zero-copy, same GPU). The handle-packing
   logic is ported verbatim from the proven ``weight_sync/trainer_sync.py``.
 * :meth:`extract_hf_state` turns the trainer's model into the HF-named, bf16,
-  GPU-resident parameter stream that :meth:`update_weights` consumes. This is the
-  one correctness-critical piece left as a guided ``TODO(human)``.
+  GPU-resident parameter stream that :meth:`update_weights` consumes.
 
 The Pie client is async; the trainer loop is sync. For the prototype we bridge
 with ``asyncio.run`` per call (a single long-lived loop is the later
@@ -146,9 +145,7 @@ class PieRolloutWorker:
             # 'value'"); check the Pie server log if `value` is uninformative.
             raise RuntimeError(f"update_weights failed: {value!r}")
 
-    def update_weights(
-        self, named_tensors: Iterable[tuple[str, torch.Tensor]]
-    ) -> None:
+    def update_weights(self, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Push policy weights into the live rollout engine via CUDA IPC.
 
         ``named_tensors`` is the HF-named, bf16, GPU-resident stream produced by
@@ -199,8 +196,7 @@ class PieRolloutWorker:
 
         * **Plain module** (the Phase-1 parity test passes a raw
           ``AutoModelForCausalLM``) — VERIFIED, below: cast to bf16, ensure CUDA.
-        * **FSDP-wrapped actor** (Phase 2: ``PieActor.fsdp_module``) — the active
-          ``TODO(human)``.
+        * **FSDP-wrapped actor** (Phase 2: ``PieActor.fsdp_module``)``.
         """
         if PieRolloutWorker._is_fsdp_wrapped(model):
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -216,4 +212,3 @@ class PieRolloutWorker:
         # Plain-model path
         for name, param in model.named_parameters():
             yield (name, param.bfloat16().cuda())
-

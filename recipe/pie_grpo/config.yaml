@@ -4,12 +4,12 @@
 
 model:
   # Must match the Pie server's [[model]] hf_repo (weight sync needs identical
-  # architecture + param names). 0.5B fits a full-AdamW actor alongside Pie's
-  # colocated vLLM engine on a single 24GB GPU; scale up on bigger/multi-GPU HW.
-  path: Qwen/Qwen2.5-Coder-0.5B-Instruct
+  # architecture + param names). 1.5B fits now that the actor is FSDP-sharded
+  # across 2 GPUs under torchrun (see launch note at the bottom of this file).
+  path: Qwen/Qwen2.5-Coder-1.5B-Instruct
   # Set to `eager` to force the fallback used when flash_attn is unavailable.
   # Set to `auto` (or omit the key) to use flash_attention_2 when installed.
-  attn_implementation: auto
+  attn_implementation: sdpa
 
 actor:
   lr: 3.0e-6
@@ -40,7 +40,7 @@ pie:
   grpo_inferlet: grpo@0.1.0
 
 train:
-  num_steps: 100         # real run — long enough for a held-out trend to clear noise
+  num_steps: 50         # real run — long enough for a held-out trend to clear noise
   max_prompt_len: 512
   sync_weights: true     # push policy → rollout engine after each step
 
@@ -53,6 +53,21 @@ data:
 eval:
   parquet: /home/george/agentic-rl/RL-Heval/data/humaneval_test.parquet
   n_problems: null       # null = all held-out problems (~26)
+  # MBPP transfer eval — DISJOINT from HumanEval training, ~257 held-out problems
+  # → resolves sub-3% gains the 33-problem heval can't. Prepared once by
+  # PieRL/data/prepare_mbpp.py; comment out mbpp_parquet to disable.
+  mbpp_parquet: /home/george/agentic-rl/PieRL/data/mbpp_test.parquet
+  mbpp_n_problems: 100   # cap the periodic eval cost (null = all ~257)
   every_steps: 5         # eval at baseline, then every N steps + final
   temperature: 0.0       # greedy pass@1; bump to ~0.2 if Pie's sampler rejects 0
   top_p: 1.0
+  max_workers: 10
+
+# --- Multi-GPU launch -------------------------------------------------------
+# The actor is FSDP-sharded across 2 GPUs via torchrun; rank 0 (the FIRST visible
+# device) is colocated with the Pie engine, so put Pie on that same physical GPU.
+# Pie server: qwen-rl-config.toml `device = ["cuda:5"]`, same 1.5B hf_repo.
+# Trainer:
+#   CUDA_VISIBLE_DEVICES=5,3 torchrun --nproc_per_node=2 \
+#       -m recipe.pie_grpo.train_grpo --config recipe/pie_grpo/config.yaml
+# (rank0 -> physical cuda:5 = Pie's GPU; rank1 -> physical cuda:3.)

@@ -36,6 +36,31 @@ def _extract_code(text: str) -> str:
     return text
 
 
+def _run_sandboxed(full_code: str) -> float:
+    """Execute ``full_code`` in a resource-capped subprocess; 1.0 iff it exits 0.
+
+    RLIMIT_AS 256 MB, RLIMIT_CPU 10 s, 10 s wall — the standard HumanEval caps.
+    Shared by the HumanEval and MBPP rewards (see ``mbpp_reward.py``). SECURITY:
+    this runs model-generated code; trusted hardware only.
+    """
+    mem_bytes = 256 * 1024 * 1024  # 256 MB address space
+
+    def _preexec():
+        resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+        resource.setrlimit(resource.RLIMIT_CPU, (10, 10))  # 10 CPU-seconds
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", full_code],
+            timeout=10,
+            capture_output=True,
+            preexec_fn=_preexec,
+        )
+        return 1.0 if result.returncode == 0 else 0.0
+    except Exception:
+        return 0.0
+
+
 def compute_reward(solution_str: str, ground_truth) -> float:
     """1.0 if ``solution_str`` passes the HumanEval test, else 0.0.
 
@@ -51,19 +76,6 @@ def compute_reward(solution_str: str, ground_truth) -> float:
         else:
             body = gt["prompt"] + code
         full_code = body + "\n\n" + gt["test"] + f"\ncheck({gt['entry_point']})\n"
-
-        mem_bytes = 256 * 1024 * 1024  # 256 MB address space
-
-        def _preexec():
-            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-            resource.setrlimit(resource.RLIMIT_CPU, (10, 10))  # 10 CPU-seconds
-
-        result = subprocess.run(
-            [sys.executable, "-c", full_code],
-            timeout=10,
-            capture_output=True,
-            preexec_fn=_preexec,
-        )
-        return 1.0 if result.returncode == 0 else 0.0
     except Exception:
         return 0.0
+    return _run_sandboxed(full_code)

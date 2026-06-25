@@ -20,6 +20,7 @@ Run in Pie's ``vllm`` venv, on the SAME GPU as a live Pie server started with
 from __future__ import annotations
 
 import argparse
+import os
 
 import numpy as np
 import torch
@@ -27,6 +28,8 @@ import yaml
 
 from recipe.pie_grpo.actor_bootstrap import PieActor
 from recipe.pie_grpo.humaneval_reward import compute_reward
+from recipe.pie_grpo.mbpp_reward import compute_mbpp_reward
+from concurrent.futures import ProcessPoolExecutor
 from recipe.pie_grpo.pie_rollout_worker import PieRolloutWorker
 from verl.protocol import DataProto
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
@@ -34,7 +37,7 @@ from verl.utils.model import compute_position_id_with_mask
 
 
 # --------------------------------------------------------------------------- #
-# Manual #1 (active TODO) — rollout → DataProto                                #
+# rollout → DataProto                                #
 # --------------------------------------------------------------------------- #
 def pack_dataproto(
     prompts: list[str],
@@ -137,7 +140,9 @@ def load_humaneval(
     return prompts, ground_truths
 
 
-def load_humaneval_fixed(parquet_path: str, n_problems: int | None) -> tuple[list[str], list]:
+def load_humaneval_fixed(
+    parquet_path: str, n_problems: int | None
+) -> tuple[list[str], list]:
     """Load a FIXED held-out set (the first ``n_problems``, or all if ``None``) — the
     same problems every eval, so the pass-rate curve reflects the policy, not which
     problems happened to be sampled. Use the *test* parquet (never trained on)."""
@@ -151,7 +156,12 @@ def load_humaneval_fixed(parquet_path: str, n_problems: int | None) -> tuple[lis
     return prompts, ground_truths
 
 
-def reward_fn(gen: list[dict], ground_truths: list) -> list[float]:
+def _reward_for_prompt(job: tuple[list[dict], object]) -> list[float]:
+    samples, ground_truth = job
+    return [compute_reward(sample["text"], ground_truth) for sample in samples]
+
+
+def reward_fn(gen: list[dict], ground_truths: list, workers: int = 1) -> list[float]:
     """Per-sample HumanEval unit-test reward, **prompt-major** (must match
     pack_dataproto's row order): for prompt ``p``, score every completion against
     that problem's ground-truth via the sandboxed runner ``compute_reward``.
@@ -163,20 +173,69 @@ def reward_fn(gen: list[dict], ground_truths: list) -> list[float]:
     order: all of prompt 0's samples, then prompt 1's, ... — the exact order pack_dataproto and the advantage
     grouping (``uid``) assume.
     """
-    rew_list = []
-    for p, per_prompt in enumerate(gen):
-        for sample in per_prompt["samples"]:
-            rew = compute_reward(sample["text"], ground_truths[p])
-            rew_list.append(rew)
-    return rew_list
+    jobs = [
+        ([sample for sample in per_prompt["samples"]], ground_truths[p])
+        for p, per_prompt in enumerate(gen)
+    ]
+    if not jobs:
+        return []
+
+    max_workers = min(len(jobs), workers)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        prompt_rewards = list(executor.map(_reward_for_prompt, jobs))
+
+    return [
+        reward
+        for prompt_rewards_per_prompt in prompt_rewards
+        for reward in prompt_rewards_per_prompt
+    ]
+
+
+def _mbpp_reward_for_prompt(job: tuple[list[dict], object]) -> list[float]:
+    samples, ground_truth = job
+    return [compute_mbpp_reward(sample["text"], ground_truth) for sample in samples]
+
+
+def mbpp_reward_fn(
+    gen: list[dict], ground_truths: list, workers: int = 1
+) -> list[float]:
+    """MBPP transfer-eval reward — prompt-major, mirrors ``reward_fn`` but scores
+    each completion with ``compute_mbpp_reward`` (the disjoint-benchmark signal)."""
+    jobs = [
+        ([sample for sample in per_prompt["samples"]], ground_truths[p])
+        for p, per_prompt in enumerate(gen)
+    ]
+    if not jobs:
+        return []
+
+    max_workers = min(len(jobs), workers)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        prompt_rewards = list(executor.map(_mbpp_reward_for_prompt, jobs))
+
+    return [
+        reward
+        for prompt_rewards_per_prompt in prompt_rewards
+        for reward in prompt_rewards_per_prompt
+    ]
 
 
 def evaluate(
-    worker, prompts, ground_truths, *, system, max_tokens, temperature, top_p
+    worker,
+    prompts,
+    ground_truths,
+    *,
+    reward=reward_fn,
+    max_workers,
+    system,
+    max_tokens,
+    temperature,
+    top_p,
 ) -> float:
     """Held-out pass@1: one (greedy-ish) completion per FIXED problem, the fraction
     that passes the unit tests. No weight update — pure measurement on problems the
-    policy never trains on, so a rising value across steps is unambiguous learning."""
+    policy never trains on, so a rising value across steps is unambiguous learning.
+
+    ``reward`` selects the scorer: ``reward_fn`` (HumanEval) or ``mbpp_reward_fn``."""
     gen = worker.generate(
         prompts,
         n_samples=1,
@@ -185,7 +244,9 @@ def evaluate(
         top_p=top_p,
         system=system,
     )
-    rewards = reward_fn(gen, ground_truths)  # one per prompt (n_samples=1)
+    rewards = reward(
+        gen, ground_truths, workers=max_workers
+    )  # one per prompt (n_samples=1)
     return sum(rewards) / len(rewards)
 
 
@@ -203,15 +264,77 @@ def _scatter_rewards_to_tokens(
 
 
 # --------------------------------------------------------------------------- #
+# Distributed helpers (SPMD under torchrun)                                    #
+# --------------------------------------------------------------------------- #
+def _dist_info() -> tuple[int, int]:
+    """``(rank, world_size)`` from the launcher's env (torchrun) — or (0, 1)."""
+    return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def sync_weights(worker, module, *, rank: int) -> None:
+    """Push the actor's current policy into the live Pie rollout engine.
+
+    ``extract_hf_state`` runs FSDP ``summon_full_params`` — an all-gather
+    COLLECTIVE — so EVERY rank must drive it in lockstep or the run deadlocks.
+    ``list(...)`` forces the generator to completion inside the summon context on
+    all ranks (collective balanced), and the bf16 ``.clone()`` it does inside the
+    context means the gathered tensors survive after the context exits (FSDP frees
+    its flat-param shards, but our clones are independent). Only rank 0 shares a
+    physical GPU with the engine, so only rank 0 packs the (same-GPU, zero-copy)
+    CUDA-IPC handles and pushes them over the WebSocket.
+    """
+    named = list(PieRolloutWorker.extract_hf_state(module))  # collective on all ranks
+    if rank == 0:
+        worker.update_weights(named)
+    del named
+
+
+def broadcast_rollout(dp, rewards, *, world_size: int, src: int = 0):
+    """Replicate rank-``src``'s rollout batch to EVERY FSDP rank.
+
+    FSDP shards the *model + optimizer* across GPUs (the memory win that fits a
+    >0.5B actor); we feed the *same data* to every rank so the forward/backward
+    collectives line up and grads reduce-scatter consistently. This is
+    memory-parallel, not data-parallel — a DP batch-split (≈2x throughput) is a
+    later optimization, not needed to clear the 0.5B ceiling.
+
+    Only rank ``src`` ran the Pie rollout, so it holds the packed ``DataProto``
+    ``dp`` and the per-sample reward tensor ``rewards``; on every other rank they
+    arrive as ``None`` and must be filled from the broadcast. Returns the
+    rank-local ``(dp, rewards)``.
+    """
+    if world_size == 1:
+        return dp, rewards
+    # broadcast_object_list is COLLECTIVE: every rank calls it identically with the
+    # same ``src``; the API sends from ``src`` and overwrites the list IN PLACE on
+    # the others. So there's no sender/receiver branch — just capture the in-place
+    # fill back out of the named list (returning the local names would hand back the
+    # un-filled None on non-src ranks).
+    obj = [dp, rewards]
+    torch.distributed.broadcast_object_list(obj, src=src)
+    dp, rewards = obj
+    return dp, rewards
+
+
+# --------------------------------------------------------------------------- #
 # Loop                                                                         #
 # --------------------------------------------------------------------------- #
 def train(cfg: dict) -> None:
+    rank, world_size = _dist_info()
+    is_main = rank == 0
     rollout, actor_cfg = cfg["rollout"], cfg["actor"]
 
-    worker = PieRolloutWorker(
-        pie_uri=cfg["pie"]["uri"],
-        username=cfg["pie"]["username"],
-        grpo_inferlet=cfg["pie"]["grpo_inferlet"],
+    # Only rank 0 talks to Pie (generation, weight-push, eval). EVERY rank builds
+    # the FSDP actor and runs the collectives (compute_log_prob / update_actor /
+    # weight-extract) — those must stay in lockstep across ranks.
+    worker = (
+        PieRolloutWorker(
+            pie_uri=cfg["pie"]["uri"],
+            username=cfg["pie"]["username"],
+            grpo_inferlet=cfg["pie"]["grpo_inferlet"],
+        )
+        if is_main
+        else None
     )
     actor = PieActor(
         model_path=cfg["model"]["path"],
@@ -232,111 +355,144 @@ def train(cfg: dict) -> None:
     eval_cfg = cfg.get("eval", {})
 
     # Push the actor's real initial weights up front so Pie isn't on dummy weights
-    # for the baseline eval / first rollout (also avoids a wasted garbage step 0).
+    # for the baseline eval / first rollout. Collective on all ranks; rank 0 pushes.
     if cfg["train"]["sync_weights"]:
-        worker.update_weights(PieRolloutWorker.extract_hf_state(actor.fsdp_module))
+        sync_weights(worker, actor.fsdp_module, rank=rank)
 
-    # Fixed held-out set (same problems every eval → a clean learning curve).
-    eval_prompts, eval_gts = load_humaneval_fixed(
-        eval_cfg["parquet"], eval_cfg.get("n_problems")
-    )
-
-    def run_eval(tag: str) -> float:
-        acc = evaluate(
-            worker,
-            eval_prompts,
-            eval_gts,
-            system=rollout.get("system"),
-            max_tokens=rollout["max_tokens"],
-            temperature=eval_cfg.get("temperature", 0.0),
-            top_p=eval_cfg.get("top_p", 1.0),
+    # Fixed held-out sets + eval closure live on rank 0 (the only Pie talker).
+    if is_main:
+        eval_prompts, eval_gts = load_humaneval_fixed(
+            eval_cfg["parquet"], eval_cfg.get("n_problems")
         )
-        print(f"[eval {tag}] held-out pass@1 = {acc:.3f}  (n={len(eval_prompts)})")
-        return acc
+        # Optional MBPP transfer eval — same parquet schema, so reuse the loader.
+        mbpp_prompts, mbpp_gts = [], []
+        mbpp_parquet = eval_cfg.get("mbpp_parquet")
+        if mbpp_parquet and os.path.exists(mbpp_parquet):
+            mbpp_prompts, mbpp_gts = load_humaneval_fixed(
+                mbpp_parquet, eval_cfg.get("mbpp_n_problems")
+            )
 
-    run_eval("baseline")  # base-model pass@1 before any training
+        def run_eval(tag: str) -> float:
+            acc = evaluate(
+                worker,
+                eval_prompts,
+                eval_gts,
+                reward=reward_fn,
+                max_workers=eval_cfg.get("max_workers", 1),
+                system=rollout.get("system"),
+                max_tokens=rollout["max_tokens"],
+                temperature=eval_cfg.get("temperature", 0.0),
+                top_p=eval_cfg.get("top_p", 1.0),
+            )
+            line = f"[eval {tag}] heval pass@1 = {acc:.3f}  (n={len(eval_prompts)})"
+            if mbpp_prompts:
+                m = evaluate(
+                    worker,
+                    mbpp_prompts,
+                    mbpp_gts,
+                    reward=mbpp_reward_fn,
+                    max_workers=eval_cfg.get("max_workers", 1),
+                    system=rollout.get("system"),
+                    max_tokens=rollout["max_tokens"],
+                    temperature=eval_cfg.get("temperature", 0.0),
+                    top_p=eval_cfg.get("top_p", 1.0),
+                )
+                line += f"  |  mbpp pass@1 = {m:.3f}  (n={len(mbpp_prompts)})"
+            print(line)
+            return acc
+
+        run_eval("baseline")  # base-model pass@1 before any training
 
     # Per-step (train) pass-rate — noisy because each step samples DIFFERENT problems;
     # the held-out eval above is the rigorous curve. run_mean smooths the train noise.
     reward_history: list[float] = []
     every = eval_cfg.get("every_steps", 5)
     for step in range(cfg["train"]["num_steps"]):
-        # 0. this step's HumanEval problems (prompts + their ground-truths)
-        prompts, ground_truths = load_humaneval(
-            cfg["data"]["humaneval_parquet"], cfg["data"]["problems_per_step"], step
-        )
+        # 0-1. rank 0 only: this step's problems → rollout → reward (all Pie I/O).
+        if is_main:
+            prompts, ground_truths = load_humaneval(
+                cfg["data"]["humaneval_parquet"], cfg["data"]["problems_per_step"], step
+            )
+            gen = worker.generate(
+                prompts,
+                n_samples=rollout["n_samples"],
+                max_tokens=rollout["max_tokens"],
+                temperature=rollout["temperature"],
+                top_p=rollout["top_p"],
+                system=rollout.get("system"),
+            )
+            # 2. pack into a padded DataProto  (Manual #1)
+            dp = pack_dataproto(prompts, gen, tokenizer, system=rollout.get("system"))
+            rewards = torch.tensor(reward_fn(gen, ground_truths))
+        else:
+            gen = dp = rewards = None
 
-        # 1. rollout — all n_samples per prompt come back batched
-        gen = worker.generate(
-            prompts,
-            n_samples=rollout["n_samples"],
-            max_tokens=rollout["max_tokens"],
-            temperature=rollout["temperature"],
-            top_p=rollout["top_p"],
-            system=rollout.get("system"),
-        )
+        # 2b. replicate rank-0's batch to every FSDP rank (Learn-by-Doing).
+        dp, rewards = broadcast_rollout(dp, rewards, world_size=world_size)
 
-        # 2. pack into a padded DataProto  (Manual #1)
-        dp = pack_dataproto(prompts, gen, tokenizer, system=rollout.get("system"))
-
-        # 3. old_log_probs (trainer-side, padded & shifted) — score at the rollout
+        # 3. old_log_probs — COLLECTIVE (all ranks), scored at the rollout
         #    temperature so the ratio's behaviour policy is the one that sampled.
         dp.batch["old_log_probs"] = actor.compute_log_prob(
             dp, temperature=rollout["temperature"]
         )
 
-        # 4. reward → token-level → group-relative advantage (by uid)
-        rewards = torch.tensor(reward_fn(gen, ground_truths))
+        # 4. reward → token-level → group-relative advantage (by uid). Deterministic
+        #    and identical on every rank (same dp + rewards) → no extra broadcast.
         response_mask = dp.batch["response_mask"].float()
         token_level = _scatter_rewards_to_tokens(rewards, response_mask)
         uid = dp.non_tensor_batch["uid"]
         advantages, _ = compute_grpo_outcome_advantage(token_level, response_mask, uid)
         dp.batch["advantages"] = advantages
 
-        # 5. one GRPO/PPO optimizer step (same temperature as old_log_probs)
+        # 5. one GRPO/PPO optimizer step — COLLECTIVE (all ranks).
         metrics = actor.update_actor(
             dp, num_mini_batch=1, temperature=rollout["temperature"]
         )
 
-        # 6. push updated policy → live rollout engine (CUDA-IPC, same GPU)
+        # 6. push updated policy → live rollout engine. Barrier so rank 0 doesn't
+        #    extract mid-step; collective extract on all ranks, rank 0 pushes.
+        if world_size > 1:
+            torch.distributed.barrier()
         if cfg["train"]["sync_weights"]:
-            worker.update_weights(PieRolloutWorker.extract_hf_state(actor.fsdp_module))
+            sync_weights(worker, actor.fsdp_module, rank=rank)
 
-        # --- verification readout ---
+        # --- verification readout (rank 0 only) ---
         # reward_std > 0 means the group has signal; adv|mean| > 0 means GRPO
         # produced a real gradient; the sample text shows garbage→coherent as the
         # pushed weights take effect on later steps.
-        def _scalar(v):
-            if isinstance(v, (list, tuple)):
-                v = v[0] if v else float("nan")
-            if hasattr(v, "value"):  # verl Metric
-                v = v.value
-            if hasattr(v, "item"):  # tensor
-                v = v.item()
-            return float(v)
+        if is_main:
 
-        try:
-            pg_loss = _scalar(metrics["metrics"].get("actor/pg_loss"))
-        except Exception:
-            pg_loss = float("nan")
-        rmask_b = response_mask.bool()
-        adv_abs = advantages[rmask_b].abs().mean().item()
-        rmean = rewards.mean().item()
-        reward_history.append(rmean)
-        run_mean = sum(reward_history) / len(reward_history)  # cumulative pass-rate
-        sample_txt = gen[0]["samples"][0]["text"].replace("\n", " ")[:100]
-        print(
-            f"[step {step:2d}] reward_mean={rmean:.3f} reward_std={rewards.std():.3f} "
-            f"adv|mean|={adv_abs:.4f} pg_loss={pg_loss:+.5f}  run_mean={run_mean:.3f}\n"
-            f"           sample: {sample_txt!r}"
-        )
+            def _scalar(v):
+                if isinstance(v, (list, tuple)):
+                    v = v[0] if v else float("nan")
+                if hasattr(v, "value"):  # verl Metric
+                    v = v.value
+                if hasattr(v, "item"):  # tensor
+                    v = v.item()
+                return float(v)
 
-        if (step + 1) % every == 0 or step == cfg["train"]["num_steps"] - 1:
-            run_eval(f"step {step}")
+            try:
+                pg_loss = _scalar(metrics["metrics"].get("actor/pg_loss"))
+            except Exception:
+                pg_loss = float("nan")
+            rmask_b = response_mask.bool()
+            adv_abs = advantages[rmask_b].abs().mean().item()
+            rmean = rewards.float().mean().item()
+            reward_history.append(rmean)
+            run_mean = sum(reward_history) / len(reward_history)  # cumulative pass-rate
+            sample_txt = gen[0]["samples"][0]["text"].replace("\n", " ")[:100]
+            print(
+                f"[step {step:2d}] reward_mean={rmean:.3f} reward_std={rewards.float().std():.3f} "
+                f"adv|mean|={adv_abs:.4f} pg_loss={pg_loss:+.5f}  run_mean={run_mean:.3f}\n"
+                f"           sample: {sample_txt!r}"
+            )
+
+            if (step + 1) % every == 0 or step == cfg["train"]["num_steps"] - 1:
+                run_eval(f"step {step}")
 
     # Learning-curve summary: first vs last third of steps (rough — each step uses
     # different problems; a held-out eval set would be the rigorous trend).
-    if len(reward_history) >= 3:
+    if is_main and len(reward_history) >= 3:
         k = len(reward_history) // 3
         first = sum(reward_history[:k]) / k
         last = sum(reward_history[-k:]) / k
