@@ -1,7 +1,3 @@
-# Phase 3 — standalone GRPO loop config (recipe/pie_grpo/train_grpo.py).
-# Plain YAML (loaded with PyYAML), not Hydra: actor_bootstrap.py already takes
-# explicit kwargs, so a flat dict keeps the wiring obvious and dependency-free.
-
 model:
   # Must match the Pie server's [[model]] hf_repo (weight sync needs identical
   # architecture + param names). 1.5B fits now that the actor is FSDP-sharded
@@ -39,8 +35,18 @@ pie:
   username: rl-trainer
   grpo_inferlet: grpo@0.1.0
 
+# Topology (Stage B) — un-hardcodes the 2-GPU / same-GPU-IPC assumptions. All
+# optional; the defaults below reproduce the current colocated DP=2 behaviour
+# exactly (world/fsdp follow torchrun, identity device map, cross-GPU IPC off).
+topology:
+  world_size: auto         # auto → launcher WORLD_SIZE; or an int
+  fsdp_size: auto          # auto → world_size (pure ZeRO-3); int < ws → hybrid mesh
+  weight_sync:
+    device_map: identity   # identity → device_idx == rank (same-GPU CUDA-IPC)
+    allow_cross_gpu_ipc: false  # cross-GPU IPC needs P2P/NVLink (this box: CNS)
+
 train:
-  num_steps: 50         # real run — long enough for a held-out trend to clear noise
+  num_steps: 50        # real run — long enough for a held-out trend to clear noise
   max_prompt_len: 512
   sync_weights: true     # push policy → rollout engine after each step
 
@@ -62,12 +68,3 @@ eval:
   temperature: 0.0       # greedy pass@1; bump to ~0.2 if Pie's sampler rejects 0
   top_p: 1.0
   max_workers: 10
-
-# --- Multi-GPU launch -------------------------------------------------------
-# The actor is FSDP-sharded across 2 GPUs via torchrun; rank 0 (the FIRST visible
-# device) is colocated with the Pie engine, so put Pie on that same physical GPU.
-# Pie server: qwen-rl-config.toml `device = ["cuda:5"]`, same 1.5B hf_repo.
-# Trainer:
-#   CUDA_VISIBLE_DEVICES=5,3 torchrun --nproc_per_node=2 \
-#       -m recipe.pie_grpo.train_grpo --config recipe/pie_grpo/config.yaml
-# (rank0 -> physical cuda:5 = Pie's GPU; rank1 -> physical cuda:3.)

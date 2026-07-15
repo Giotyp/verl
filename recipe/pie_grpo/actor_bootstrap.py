@@ -58,6 +58,7 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 # Side effect: route verl's unpad_input through transformers' pure-torch impl so
 # the padded↔nested conversion works in the flash_attn-less Pie `vllm` venv.
 from recipe.pie_grpo import _flash_attn_compat  # noqa: F401
+from recipe.pie_grpo.topology import device_for_rank
 
 
 def ensure_dist_ws1(master_addr: str = "127.0.0.1", master_port: int = 29512) -> None:
@@ -78,7 +79,7 @@ def ensure_dist_ws1(master_addr: str = "127.0.0.1", master_port: int = 29512) ->
     """
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+        torch.cuda.set_device(device_for_rank(None, local_rank))
     if torch.distributed.is_initialized():
         return
     os.environ.setdefault("RANK", "0")
@@ -115,6 +116,7 @@ def _build_configs(
     micro_batch_size_per_gpu: int,
     max_token_len_per_gpu: int,
     rollout_n: int,
+    fsdp_size: int | None = None,
     param_offload: bool = False,
     optimizer_offload: bool = False,
     grad_offload: bool = False,
@@ -139,10 +141,13 @@ def _build_configs(
 
     engine_config = FSDPEngineConfig(
         strategy="fsdp",
-        # Shard params+grads+optimizer across every rank the launcher gave us:
+        # Shard params+grads+optimizer across `fsdp_size` ranks (Stage B: resolved
+        # from the topology config, falling back to the launcher's WORLD_SIZE).
         # WS=1 -> a formality (no real sharding); torchrun WS>1 -> the memory win
         # that lets a >0.5B actor fit alongside a colocated Pie engine.
-        fsdp_size=int(os.environ.get("WORLD_SIZE", "1")),
+        fsdp_size=(
+            fsdp_size if fsdp_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
+        ),
         model_dtype="bf16",  # rollout/compute dtype.
         # CPU-offload to fit the trainer alongside Pie's colocated vLLM engine.
         # AdamW states (~12GB for 1.5B fp32 m+v) + master copy dwarf the model;
@@ -203,6 +208,7 @@ class PieActor:
         max_token_len_per_gpu: int = 8192,
         rollout_n: int = 8,
         master_port: int = 29512,
+        fsdp_size: int | None = None,
         param_offload: bool = False,
         optimizer_offload: bool = False,
         grad_offload: bool = False,
@@ -219,6 +225,7 @@ class PieActor:
             micro_batch_size_per_gpu=micro_batch_size_per_gpu,
             max_token_len_per_gpu=max_token_len_per_gpu,
             rollout_n=rollout_n,
+            fsdp_size=fsdp_size,
             param_offload=param_offload,
             optimizer_offload=optimizer_offload,
             grad_offload=grad_offload,
@@ -287,6 +294,26 @@ class PieActor:
         out = self.worker.infer_batch(td)
         return no_padding_2_padding(tu.get(out, "log_probs"), td)
 
+    @staticmethod
+    def _global_batch_size(local_rows: int) -> int:
+        """Sum the per-rank row count across the data-parallel world.
+
+        Under group-aware data-parallel training each rank holds only its DISJOINT
+        shard, so ``td.shape[0]`` is a LOCAL count. ``ppo_loss``'s seq-mean loss-agg
+        modes normalize by ``global_batch_size``; feeding the local count would
+        under-normalize. (The default ``token-mean`` mode uses the engine's all-reduced
+        ``batch_num_tokens`` instead and is unaffected — this keeps the value correct
+        if the mode ever changes.) Reduces to a no-op when not distributed.
+        """
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() == 1
+        ):
+            return local_rows
+        t = torch.tensor([local_rows], device=torch.cuda.current_device())
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+        return int(t.item())
+
     def update_actor(
         self,
         data,
@@ -309,7 +336,7 @@ class PieActor:
             td,
             num_mini_batch=num_mini_batch,
             epochs=epochs,
-            global_batch_size=td.shape[0],
+            global_batch_size=self._global_batch_size(td.shape[0]),
             temperature=float(temperature),
         )
         return self.worker.train_mini_batch(td)

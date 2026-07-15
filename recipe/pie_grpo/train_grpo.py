@@ -31,6 +31,11 @@ from recipe.pie_grpo.humaneval_reward import compute_reward
 from recipe.pie_grpo.mbpp_reward import compute_mbpp_reward
 from concurrent.futures import ProcessPoolExecutor
 from recipe.pie_grpo.pie_rollout_worker import PieRolloutWorker
+from recipe.pie_grpo.topology import (
+    device_idx_for_rank,
+    resolve_fsdp_size,
+    resolve_world_size,
+)
 from verl.protocol import DataProto
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 from verl.utils.model import compute_position_id_with_mask
@@ -271,70 +276,115 @@ def _dist_info() -> tuple[int, int]:
     return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
 
 
-def sync_weights(worker, module, *, rank: int) -> None:
-    """Push the actor's current policy into the live Pie rollout engine.
+def sync_weights(worker, module, *, device_idx: int) -> None:
+    """Push this rank's policy weights into its colocated Pie DP replica.
 
     ``extract_hf_state`` runs FSDP ``summon_full_params`` — an all-gather
-    COLLECTIVE — so EVERY rank must drive it in lockstep or the run deadlocks.
-    ``list(...)`` forces the generator to completion inside the summon context on
-    all ranks (collective balanced), and the bf16 ``.clone()`` it does inside the
-    context means the gathered tensors survive after the context exits (FSDP frees
-    its flat-param shards, but our clones are independent). Only rank 0 shares a
-    physical GPU with the engine, so only rank 0 packs the (same-GPU, zero-copy)
-    CUDA-IPC handles and pushes them over the WebSocket.
+    COLLECTIVE — so the ``list(...)`` below must run on EVERY rank in lockstep (it
+    does), or the run deadlocks. After it, every rank holds the full, identical
+    model on its own GPU. Under DP each rank then pushes to ITS replica
+    (``device_idx == rank``), a same-GPU zero-copy CUDA-IPC transfer — so both
+    replicas end up identical. (Phase-1 single-engine code pushed only on rank 0.)
     """
     named = list(PieRolloutWorker.extract_hf_state(module))  # collective on all ranks
-    if rank == 0:
-        worker.update_weights(named)
-    del named
+    worker.update_weights(named, device_idx=device_idx)
 
 
-def broadcast_rollout(dp, rewards, *, world_size: int, src: int = 0):
-    """Replicate rank-``src``'s rollout batch to EVERY FSDP rank.
+def assign_groups_to_ranks(uid, world_size: int) -> list[list[int]]:
+    """Partition row indices into ``world_size`` disjoint lists along WHOLE uid-groups.
 
-    FSDP shards the *model + optimizer* across GPUs (the memory win that fits a
-    >0.5B actor); we feed the *same data* to every rank so the forward/backward
-    collectives line up and grads reduce-scatter consistently. This is
-    memory-parallel, not data-parallel — a DP batch-split (≈2x throughput) is a
-    later optimization, not needed to clear the 0.5B ceiling.
+    Group-aware data-parallel training: each FSDP rank trains a DISJOINT set of
+    prompt groups, so the actor-update compute is split (not duplicated) across
+    ranks — the ~2x throughput win. ``uid`` is ``dp.non_tensor_batch["uid"]`` (a
+    numpy object array, one entry per row) equal to the prompt index; a prompt's
+    ``n_samples`` completions share a uid and are contiguous (see ``pack_dataproto``).
 
-    Only rank ``src`` ran the Pie rollout, so it holds the packed ``DataProto``
-    ``dp`` and the per-sample reward tensor ``rewards``; on every other rank they
-    arrive as ``None`` and must be filled from the broadcast. Returns the
-    rank-local ``(dp, rewards)``.
+    Return a list of ``world_size`` lists of row indices (into the packed batch),
+    one per rank — element ``i`` is the rows rank ``i`` will train on. Two invariants
+    make the result CORRECT and DEADLOCK-FREE:
+
+      1. WHOLE groups only. Every row of a given uid must land on the SAME rank —
+         GRPO normalizes advantage within a uid group, so a split group silently
+         corrupts its mean/std (``compute_grpo_outcome_advantage`` even special-cases
+         a size-1 group to mean=0/std=1). Advantages are already computed on the full
+         batch before this split, but keeping groups whole also keeps the per-rank
+         token bookkeeping honest.
+      2. EQUAL row count per rank. Static batching (``use_dynamic_bsz=False``) chunks
+         each rank's rows with NO cross-rank count sync, so unequal rows ⇒ ranks issue
+         different numbers of FSDP collectives ⇒ hang. Equal groups-per-rank ⇒ equal
+         rows (every group is ``n_samples`` rows).
+
+    TODO(human): implement the partition. Suggested approach — take the unique uids
+    in first-seen order; assert ``len(groups) % world_size == 0`` (fail loud here
+    rather than deadlock later inside the FSDP step); split the group list into
+    ``world_size`` equal contiguous blocks; for each rank collect the row indices
+    whose uid falls in that rank's block. (If group counts were ever uneven, the plan
+    notes a dead-group padding fallback — but the assert is the right default now.)
+    """
+    # unique uids, in first-seen order
+    groups: list = []
+
+    for u in uid:
+        if u not in groups:
+            groups.append(u)
+
+    assert len(groups) % world_size == 0, (
+        f"{len(groups)} groups not divisible by world_size={world_size} — "
+        "set problems_per_step to a multiple of world_size (or pad)"
+    )
+    per_rank = len(groups) // world_size
+    row_lists: list[list[int]] = []
+    for r in range(world_size):
+        block = set(groups[r * per_rank : (r + 1) * per_rank])   # this rank's groups
+        rows = [i for i, u in enumerate(uid) if u in block]      # positions
+        row_lists.append(rows)
+    return row_lists
+
+
+def scatter_rollout(dp, *, world_size: int, rank: int, src: int = 0):
+    """Scatter rank-``src``'s per-group DataProto shards to every FSDP rank.
+
+    Replaces the old ``broadcast_rollout`` (which duplicated the FULL batch on every
+    rank — memory-parallel, not data-parallel). Only rank ``src`` ran the Pie rollout
+    and holds the packed ``dp`` with advantages already baked in; it partitions the
+    batch into ``world_size`` whole-group shards (``assign_groups_to_ranks`` +
+    ``DataProto.select_idxs``) and scatters them, so each rank returns ONLY its shard.
+    Collective: every rank must call it in lockstep with the same ``src``.
     """
     if world_size == 1:
-        return dp, rewards
-    # broadcast_object_list is COLLECTIVE: every rank calls it identically with the
-    # same ``src``; the API sends from ``src`` and overwrites the list IN PLACE on
-    # the others. So there's no sender/receiver branch — just capture the in-place
-    # fill back out of the named list (returning the local names would hand back the
-    # un-filled None on non-src ranks).
-    obj = [dp, rewards]
-    torch.distributed.broadcast_object_list(obj, src=src)
-    dp, rewards = obj
-    return dp, rewards
+        return dp
+    if rank == src:
+        row_lists = assign_groups_to_ranks(dp.non_tensor_batch["uid"], world_size)
+        shards = [dp.select_idxs(rows) for rows in row_lists]
+    else:
+        shards = None  # ignored on non-src ranks
+    out: list = [None]
+    torch.distributed.scatter_object_list(out, shards, src=src)
+    return out[0]
 
 
 # --------------------------------------------------------------------------- #
 # Loop                                                                         #
 # --------------------------------------------------------------------------- #
 def train(cfg: dict) -> None:
-    rank, world_size = _dist_info()
+    # Stage B: topology comes from the (optional) `topology:` config block; defaults
+    # reproduce the launcher-driven DP=2 path (world/fsdp = WORLD_SIZE, identity map).
+    topo = cfg.get("topology")
+    rank, _ = _dist_info()
+    world_size = resolve_world_size(topo)
+    fsdp_size = resolve_fsdp_size(topo, world_size)
     is_main = rank == 0
     rollout, actor_cfg = cfg["rollout"], cfg["actor"]
 
-    # Only rank 0 talks to Pie (generation, weight-push, eval). EVERY rank builds
-    # the FSDP actor and runs the collectives (compute_log_prob / update_actor /
-    # weight-extract) — those must stay in lockstep across ranks.
-    worker = (
-        PieRolloutWorker(
-            pie_uri=cfg["pie"]["uri"],
-            username=cfg["pie"]["username"],
-            grpo_inferlet=cfg["pie"]["grpo_inferlet"],
-        )
-        if is_main
-        else None
+    # Rank 0 drives generation + eval (Pie auto-balances the launches across both
+    # DP replicas); EVERY rank builds the FSDP actor, runs the collectives
+    # (compute_log_prob / update_actor / weight-extract) in lockstep, AND pushes its
+    # weights to its replica via `device_idx_for_rank` (identity == rank → same-GPU
+    # CUDA-IPC) so both replicas stay in sync.
+    worker = PieRolloutWorker(
+        pie_uri=cfg["pie"]["uri"],
+        username=cfg["pie"]["username"],
+        grpo_inferlet=cfg["pie"]["grpo_inferlet"],
     )
     actor = PieActor(
         model_path=cfg["model"]["path"],
@@ -347,6 +397,7 @@ def train(cfg: dict) -> None:
         max_token_len_per_gpu=actor_cfg["max_token_len_per_gpu"],
         rollout_n=rollout["n_samples"],
         master_port=actor_cfg["master_port"],
+        fsdp_size=fsdp_size,
         optimizer_offload=actor_cfg.get("optimizer_offload", False),
         param_offload=actor_cfg.get("param_offload", False),
         grad_offload=actor_cfg.get("grad_offload", False),
@@ -357,7 +408,7 @@ def train(cfg: dict) -> None:
     # Push the actor's real initial weights up front so Pie isn't on dummy weights
     # for the baseline eval / first rollout. Collective on all ranks; rank 0 pushes.
     if cfg["train"]["sync_weights"]:
-        sync_weights(worker, actor.fsdp_module, rank=rank)
+        sync_weights(worker, actor.fsdp_module, device_idx=device_idx_for_rank(topo, rank))
 
     # Fixed held-out sets + eval closure live on rank 0 (the only Pie talker).
     if is_main:
@@ -408,7 +459,11 @@ def train(cfg: dict) -> None:
     reward_history: list[float] = []
     every = eval_cfg.get("every_steps", 5)
     for step in range(cfg["train"]["num_steps"]):
-        # 0-1. rank 0 only: this step's problems → rollout → reward (all Pie I/O).
+        # 0-2. rank 0 only: problems → rollout → reward → FULL-batch advantages.
+        #      Generation is already parallel (Pie DP=2 auto-balances the launches);
+        #      the advantage math is model-free, so rank 0 computes it alone on the
+        #      WHOLE batch BEFORE the group-aware scatter — splitting a uid group
+        #      first would corrupt its group-relative mean/std.
         if is_main:
             prompts, ground_truths = load_humaneval(
                 cfg["data"]["humaneval_parquet"], cfg["data"]["problems_per_step"], step
@@ -421,40 +476,45 @@ def train(cfg: dict) -> None:
                 top_p=rollout["top_p"],
                 system=rollout.get("system"),
             )
-            # 2. pack into a padded DataProto  (Manual #1)
+            # pack into a padded DataProto  (Manual #1)
             dp = pack_dataproto(prompts, gen, tokenizer, system=rollout.get("system"))
             rewards = torch.tensor(reward_fn(gen, ground_truths))
+            # reward → token-level → group-relative advantage (by uid), full batch.
+            response_mask = dp.batch["response_mask"].float()
+            token_level = _scatter_rewards_to_tokens(rewards, response_mask)
+            uid = dp.non_tensor_batch["uid"]
+            advantages, _ = compute_grpo_outcome_advantage(
+                token_level, response_mask, uid
+            )
+            dp.batch["advantages"] = advantages
         else:
-            gen = dp = rewards = None
+            gen = dp = rewards = advantages = response_mask = None
 
-        # 2b. replicate rank-0's batch to every FSDP rank (Learn-by-Doing).
-        dp, rewards = broadcast_rollout(dp, rewards, world_size=world_size)
+        # 2b. scatter WHOLE uid-groups: each rank trains a DISJOINT shard (not the
+        #     duplicated full batch). Advantages are already baked into dp on rank 0.
+        local_dp = scatter_rollout(dp, world_size=world_size, rank=rank)
 
-        # 3. old_log_probs — COLLECTIVE (all ranks), scored at the rollout
-        #    temperature so the ratio's behaviour policy is the one that sampled.
-        dp.batch["old_log_probs"] = actor.compute_log_prob(
-            dp, temperature=rollout["temperature"]
+        # 3. old_log_probs on the LOCAL shard — COLLECTIVE (all ranks), scored at the
+        #    rollout temperature so the ratio's behaviour policy is the one that sampled.
+        local_dp.batch["old_log_probs"] = actor.compute_log_prob(
+            local_dp, temperature=rollout["temperature"]
         )
 
-        # 4. reward → token-level → group-relative advantage (by uid). Deterministic
-        #    and identical on every rank (same dp + rewards) → no extra broadcast.
-        response_mask = dp.batch["response_mask"].float()
-        token_level = _scatter_rewards_to_tokens(rewards, response_mask)
-        uid = dp.non_tensor_batch["uid"]
-        advantages, _ = compute_grpo_outcome_advantage(token_level, response_mask, uid)
-        dp.batch["advantages"] = advantages
-
-        # 5. one GRPO/PPO optimizer step — COLLECTIVE (all ranks).
+        # 4. one GRPO/PPO optimizer step on the LOCAL shard — COLLECTIVE. Grads
+        #    reduce-scatter over WORLD and the engine all-reduces batch_num_tokens, so
+        #    the gradient is the true global-token-mean over both shards (Stage A note).
         metrics = actor.update_actor(
-            dp, num_mini_batch=1, temperature=rollout["temperature"]
+            local_dp, num_mini_batch=1, temperature=rollout["temperature"]
         )
 
-        # 6. push updated policy → live rollout engine. Barrier so rank 0 doesn't
-        #    extract mid-step; collective extract on all ranks, rank 0 pushes.
+        # 5. push updated policy → live rollout engine. Barrier so rank 0 doesn't
+        #    extract mid-step; collective extract on all ranks, each pushes to its own
+        #    replica. All ranks hold identical weights after the FSDP step regardless
+        #    of which shard they trained on.
         if world_size > 1:
             torch.distributed.barrier()
         if cfg["train"]["sync_weights"]:
-            sync_weights(worker, actor.fsdp_module, rank=rank)
+            sync_weights(worker, actor.fsdp_module, device_idx=device_idx_for_rank(topo, rank))
 
         # --- verification readout (rank 0 only) ---
         # reward_std > 0 means the group has signal; adv|mean| > 0 means GRPO

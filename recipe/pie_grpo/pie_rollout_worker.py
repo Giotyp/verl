@@ -133,26 +133,30 @@ class PieRolloutWorker:
         return handles, held
 
     async def _update_weights_async(
-        self, named_tensors: Iterable[tuple[str, torch.Tensor]]
+        self, named_tensors: Iterable[tuple[str, torch.Tensor]], device_idx: int = 0
     ) -> None:
         handles, held = self.build_handles_from_named(named_tensors)
         async with PieClient(self.pie_uri) as client:
             await client.authenticate(self.username)
-            ok, value = await client.update_weights(handles)
+            ok, value = await client.update_weights(handles, device_idx=device_idx)
         del held  # sources are safe to drop once the RPC has returned
         if not ok:
             # A driver-side failure can surface opaquely (e.g. "missing field
             # 'value'"); check the Pie server log if `value` is uninformative.
             raise RuntimeError(f"update_weights failed: {value!r}")
 
-    def update_weights(self, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
-        """Push policy weights into the live rollout engine via CUDA IPC.
+    def update_weights(
+        self, named_tensors: Iterable[tuple[str, torch.Tensor]], device_idx: int = 0
+    ) -> None:
+        """Push policy weights into a live rollout engine replica via CUDA IPC.
 
         ``named_tensors`` is the HF-named, bf16, GPU-resident stream produced by
         :meth:`extract_hf_state` (or, for the Phase-1 parity test, directly from
-        a plain ``model.named_parameters()``).
+        a plain ``model.named_parameters()``). ``device_idx`` selects which DP
+        replica to push into — for same-GPU zero-copy IPC it must be the replica
+        on this process's own GPU (i.e. ``device_idx == rank``).
         """
-        asyncio.run(self._update_weights_async(named_tensors))
+        asyncio.run(self._update_weights_async(named_tensors, device_idx=device_idx))
 
     # ------------------------------------------------------------------ #
     # Weight extraction                           #
