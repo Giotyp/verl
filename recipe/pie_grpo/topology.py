@@ -60,6 +60,19 @@ def resolve_fsdp_size(topo: dict | None, world_size: int) -> int:
     return fsdp_size
 
 
+def resolve_tp_size(pie_cfg: dict | None) -> int:
+    """Pie engine tensor-parallel size = the weight-sync fan-out degree (Stage C).
+
+    Default ``1`` → one FULL model per DP replica: the trainer pushes complete
+    tensors and the engine loads them as-is (today's path, the only one this box
+    supports). ``tensor_parallel_size > 1`` means each replica is split across
+    ``tp_size`` GPUs, each holding a shard — the trainer still sends full tensors
+    but each Pie TP worker must slice its own shard on receive. That receive-side
+    sharding is NOT implemented on the pie-gt side yet, and TP needs NVLink/P2P
+    (impossible here: CNS), so ``train_grpo`` refuses ``tp_size > 1`` for now."""
+    return int((pie_cfg or {}).get("tensor_parallel_size", 1))
+
+
 def device_for_rank(topo: dict | None, local_rank: int) -> int:
     """CUDA device index (into ``CUDA_VISIBLE_DEVICES``) this rank binds to.
 

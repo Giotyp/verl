@@ -34,6 +34,11 @@ pie:
   uri: ws://127.0.0.1:8080
   username: rl-trainer
   grpo_inferlet: grpo@0.1.0
+  # Stage C — weight-sync fan-out degree. Must match the Pie server's
+  # [model.driver] tensor_parallel_size. 1 = one full model per DP replica (the
+  # only path this box supports; TP>1 needs NVLink + the pie-gt sharded-receive
+  # changes — see docs/stage_c_tp_weight_sync.md).
+  tensor_parallel_size: 1
 
 # Topology (Stage B) — un-hardcodes the 2-GPU / same-GPU-IPC assumptions. All
 # optional; the defaults below reproduce the current colocated DP=2 behaviour

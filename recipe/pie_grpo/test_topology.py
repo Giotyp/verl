@@ -56,6 +56,12 @@ def test_explicit_world_size_override():
     assert topo.resolve_world_size({"world_size": 8}) == 8    # explicit int wins over env
 
 
+def test_resolve_tp_size():
+    assert topo.resolve_tp_size(None) == 1                       # default = full-model path
+    assert topo.resolve_tp_size({}) == 1
+    assert topo.resolve_tp_size({"tensor_parallel_size": 2}) == 2
+
+
 def test_unknown_device_map_policy_rejected():
     try:
         topo.device_idx_for_rank({"weight_sync": {"device_map": "swap"}}, 0)
