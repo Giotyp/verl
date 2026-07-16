@@ -32,9 +32,9 @@ from recipe.pie_grpo.mbpp_reward import compute_mbpp_reward
 from concurrent.futures import ProcessPoolExecutor
 from recipe.pie_grpo.pie_rollout_worker import PieRolloutWorker
 from recipe.pie_grpo.topology import (
+    check_tp_supported,
     device_idx_for_rank,
     resolve_fsdp_size,
-    resolve_tp_size,
     resolve_world_size,
 )
 from verl.protocol import DataProto
@@ -374,18 +374,9 @@ def train(cfg: dict) -> None:
     rank, _ = _dist_info()
     world_size = resolve_world_size(topo)
     fsdp_size = resolve_fsdp_size(topo, world_size)
-    # Stage C seam: tp_size=1 is the full-model-per-replica path (below unchanged).
-    # tp_size>1 (each replica sharded across GPUs) needs the pie-gt sharded-receive
-    # RPC + per-worker weight_loader — not yet implemented, and TP needs NVLink/P2P
-    # this box lacks. Refuse it loudly rather than silently mis-syncing sharded weights.
-    tp_size = resolve_tp_size(cfg.get("pie"))
-    if tp_size != 1:
-        raise NotImplementedError(
-            f"pie.tensor_parallel_size={tp_size} not supported yet: TP-shard-aware "
-            "weight sync requires the pie-gt Pie-side changes (RPC tp_rank/tp_size + "
-            "per-TP-worker weight_loader shard) and NVLink/P2P hardware. See "
-            "recipe/pie_grpo/docs/stage_c_tp_weight_sync.md."
-        )
+    # Stage C seam: tp_size=1 is the full-model-per-replica path (below unchanged);
+    # tp_size>1 is refused loudly (not implemented + needs NVLink) — see check_tp_supported.
+    tp_size = check_tp_supported(cfg.get("pie"))
     is_main = rank == 0
     rollout, actor_cfg = cfg["rollout"], cfg["actor"]
 

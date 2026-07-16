@@ -62,6 +62,20 @@ def test_resolve_tp_size():
     assert topo.resolve_tp_size({"tensor_parallel_size": 2}) == 2
 
 
+def test_check_tp_supported_guard():
+    # tp_size == 1 is the supported no-op path -> returns 1, no raise
+    assert topo.check_tp_supported(None) == 1
+    assert topo.check_tp_supported({"tensor_parallel_size": 1}) == 1
+    # tp_size > 1 must fail loudly (Stage C receive-side unimplemented + needs NVLink)
+    for bad in ({"tensor_parallel_size": 2}, {"tensor_parallel_size": 4}):
+        try:
+            topo.check_tp_supported(bad)
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError(f"expected NotImplementedError for {bad}")
+
+
 def test_unknown_device_map_policy_rejected():
     try:
         topo.device_idx_for_rank({"weight_sync": {"device_map": "swap"}}, 0)

@@ -73,6 +73,25 @@ def resolve_tp_size(pie_cfg: dict | None) -> int:
     return int((pie_cfg or {}).get("tensor_parallel_size", 1))
 
 
+def check_tp_supported(pie_cfg: dict | None) -> int:
+    """Resolve tensor-parallel size and REFUSE ``tp_size > 1`` (Stage C guard).
+
+    Returns the resolved ``tp_size`` (always 1 on the current path). Raises
+    ``NotImplementedError`` for ``tp_size > 1`` so an accidental config flip fails
+    loudly at startup instead of silently mis-syncing sharded weights — the TP
+    receive-side is not implemented on the pie-gt side and TP needs NVLink/P2P this
+    box lacks. See ``docs/stage_c_tp_weight_sync.md``."""
+    tp_size = resolve_tp_size(pie_cfg)
+    if tp_size != 1:
+        raise NotImplementedError(
+            f"pie.tensor_parallel_size={tp_size} not supported yet: TP-shard-aware "
+            "weight sync requires the pie-gt Pie-side changes (RPC tp_rank/tp_size + "
+            "per-TP-worker weight_loader shard) and NVLink/P2P hardware. See "
+            "recipe/pie_grpo/docs/stage_c_tp_weight_sync.md."
+        )
+    return tp_size
+
+
 def device_for_rank(topo: dict | None, local_rank: int) -> int:
     """CUDA device index (into ``CUDA_VISIBLE_DEVICES``) this rank binds to.
 
