@@ -26,25 +26,32 @@ Deliverable: a set of scripts + instrumentation, all committed under
 
 ## RunPod / A40 specifics (the version-handling crux)
 
-- **torch/vLLM pins:** the CUDA-IPC weight-sync requires **trainer torch == driver torch**. The
-  working env is **`torch 2.11.0+cu129`, `vLLM 0.21.0`, CUDA 12.9**. RunPod A40 PyTorch base
-  images ship torch 2.1–2.8, which is **incompatible** — so the setup script creates a **fresh
-  venv** (no `--system-site-packages`) and installs the exact pins from a captured
-  `requirements.lock`, ignoring the base image's torch. torch cu129 wheels bundle their own CUDA
-  runtime; the base image only needs a **CUDA-12.9-capable NVIDIA driver** (≈550+), which RunPod
-  A40 pods have.
-- **Version guard:** after install, assert `torch.__version__ == 2.11.0+cu129` and
-  `vllm.__version__ == 0.21.0`; **fail loud** on mismatch (same philosophy as the Stage C guard) —
-  a silent torch mismatch produces a broken CUDA-IPC handle layout, the worst kind of failure.
+- **torch/vLLM pins:** the CUDA-IPC weight-sync requires **trainer torch == driver torch** (same
+  version AND build — both live in one shared venv, so it's automatic once pinned). Local env is
+  `torch 2.11.0+cu129`, `vLLM 0.21.0`. **RunPod A40 tops out at CUDA 12.8**, so cu129 wheels won't
+  run there — pin the **same torch version built for cu128**: `torch==2.11.0` from the cu128 index
+  (`https://download.pytorch.org/whl/cu128`) + `vLLM 0.21.0`. Keeping the torch VERSION identical
+  (2.11.0) preserves every version-sensitive path (the IPC handle-rebuild `args[6]` remap, vLLM's
+  torch pin); only the bundled CUDA runtime differs (12.8 vs 12.9), which is internal to the wheel
+  and consistent across trainer+driver. A40 base images ship torch 2.1–2.8 (incompatible), so the
+  setup builds a **fresh venv** (no `--system-site-packages`) and installs these pins, ignoring the
+  base torch. (2.11.0+cu128 also runs on the local 4090 → one lock serves both boxes.)
+- **Version guard:** after install, assert `torch.__version__` starts with `2.11.0`, the wheel's
+  CUDA build is ≤ the pod's max (12.8 on A40), and `vllm.__version__ == 0.21.0`; **fail loud** on
+  mismatch (same philosophy as the Stage C guard) — a silent torch mismatch produces a broken
+  CUDA-IPC handle layout, the worst kind of failure.
+- **First-pod verification:** confirm `torch==2.11.0+cu128` installs and a `pie serve` + smoke
+  rollout works before trusting the lock (fallback: nearest torch version with a cu128 build that
+  vLLM 0.21 + the Pie driver accept).
 - **A40 vs 4090:** 48 GB (vs 24 GB) removes the cuda:3 OOM-transient confound entirely; NVLink/P2P
   means the FSDP cross-GPU collectives are no longer host-staged (the speedup we're measuring).
   Design stays colocated DP=2 (each rank + its engine replica on one GPU) — unchanged from local.
-- **Pie build:** built from `pie-gt` source (their `features/RL` changes aren't in any release).
-  Open item for implementation: confirm whether the `vllm` driver path needs the `driver-cuda`
-  cargo feature (→ needs `nvcc`/CUDA toolkit + ~22-min build) or whether
-  `driver-portable,driver-dummy` suffices for the runtime + weight-sync + vLLM bridge (→ fast
-  build, no toolkit). Default to matching the local feature set; optimize if the lean build serves
-  the vllm driver.
+- **Pie build:** built from `pie-gt` source (their `features/RL` changes aren't in any release),
+  with the **lean feature set `--no-default-features --features driver-portable,driver-dummy`
+  (no `driver-cuda`)** — the GRPO loop uses the *vllm* (Python) driver, so the native CUDA driver
+  isn't needed. This means **no CUDA toolkit / nvcc and a fast build** (the runtime + weight-sync
+  Rust code compiles regardless of driver features). First-pod check: `pie serve` with the vllm
+  driver boots on the lean build (fallback: add `driver-cuda` + CUDA toolkit if it doesn't).
 
 ## Components (all under `recipe/pie_grpo/experiments/`)
 
@@ -54,12 +61,14 @@ both. Idempotent; prints the clone URLs the setup script expects.
 
 ### 2. `setup_runpod.sh` — env bootstrap (thin layer)
 Ordered, idempotent, fail-loud:
-1. System deps (git, build-essential, Rust toolchain, `cmake`/`ninja` + CUDA toolkit **iff** the
-   `driver-cuda` build is needed).
+1. System deps (git, build-essential, Rust toolchain). **No CUDA toolkit** — the lean Pie build
+   doesn't compile CUDA.
 2. Clone both public forks; checkout `pie-rl` / `features/RL`.
-3. Build `pie` from `pie-gt` → on PATH (`build_pie_dev.sh` or `cargo install --path server`).
-4. **Fresh venv** + install `requirements.lock` (torch 2.11.0+cu129, vLLM 0.21.0); editable-install
-   `pie_driver_vllm`, `pie_client` (pie-gt), `verl` (fork). **Version guard.**
+3. Build `pie` from `pie-gt` lean: `cargo install --path server --no-default-features --features
+   driver-portable,driver-dummy` → on PATH (fast, no CUDA compile).
+4. **Fresh venv** (no system-site-packages) + install `requirements.lock` (torch==2.11.0 from the
+   cu128 index, vLLM 0.21.0); editable-install `pie_driver_vllm`, `pie_client` (pie-gt), `verl`
+   (fork). **Version guard.**
 5. Vendor datasets into `experiments/data/` (parquets committed; prepare scripts for regen).
 6. Build the `grpo` inferlet (bakery) → install.
 7. Template `qwen-rl-config.toml` + `config.yaml` for the pod's 2 GPU indices (default `cuda:0,1`).
@@ -112,8 +121,10 @@ headline comparison rests on the common metrics.
 ## Risks & mitigations
 
 - **torch/vLLM drift on the base image** → fresh venv with pinned lock + a hard version guard.
-- **Pie build cost/toolkit** → confirm the lean (no-`driver-cuda`) build serves the vllm driver;
-  fall back to the full build if not.
+- **cu128 torch availability** → `torch==2.11.0+cu128` verified on the first pod; fallback to the
+  nearest torch version that has a cu128 build and that vLLM 0.21 + the Pie driver accept.
+- **Lean Pie build** → maintainer expects the vllm driver runs without `driver-cuda` (no toolkit,
+  fast build); first-pod check confirms `pie serve` boots, else fall back to the full CUDA build.
 - **NVLink actually wired on the RunPod pod** → `setup_runpod.sh` runs `nvidia-smi topo -m` and
   reports the interconnect (NVLink vs PCIe/P2P vs none) so the result is interpreted correctly.
 - **Baseline fairness** → identical model/data/reward/hyperparams; only the rollout+sync backend
