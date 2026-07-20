@@ -1,0 +1,15 @@
+[package]
+name = "grpo"
+version = "0.1.0"
+description = "GRPO rollout: parallel sampling with per-token log-probabilities"
+
+[runtime]
+core = "^0.3.0"
+
+[parameters]
+prompt = { type = "string", description = "The user prompt to complete" }
+system = { type = "string", optional = true, description = "System prompt (default: generic helpful assistant)" }
+n_samples = { type = "int", optional = true, description = "Number of completions to generate in parallel (default: 4)" }
+max_tokens = { type = "int", optional = true, description = "Maximum completion tokens per sample (default: 256)" }
+temperature = { type = "float", optional = true, description = "Sampling temperature (default: 0.8)" }
+top_p = { type = "float", optional = true, description = "Top-p nucleus sampling threshold (default: 0.95)" }
