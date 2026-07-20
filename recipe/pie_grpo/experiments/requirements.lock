@@ -195,3 +195,4 @@ xxhash==3.7.0
 yarl==1.24.2
 z3-solver==4.15.4.0
 zipp==4.1.0
+matplotlib==3.11.1
