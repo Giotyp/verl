@@ -1,0 +1,32 @@
+# Pie server config for the RunPod 2x A40 experiment.
+# setup_runpod.sh sed-replaces PIE_VENV_PATH with the created venv path.
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[auth]
+enabled = false
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+
+[model.scheduler]
+batch_policy = "adaptive"
+request_timeout_secs = 120
+
+[model.driver]
+type = "vllm"
+# 2 DP replicas, one per GPU. CVD order for the trainer MUST match this list
+# (rank0 -> cuda:0 -> device0, rank1 -> cuda:1 -> device1) so weight-sync IPC is same-GPU.
+device = ["cuda:0", "cuda:1"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+random_seed = 42
+
+[model.driver.options]
+venv = "PIE_VENV_PATH"
+gpu_memory_utilization = 0.5   # A40 48GB has ample headroom
+enforce_eager = true
+max_num_batched_tokens = 4000
+load_format = "dummy"

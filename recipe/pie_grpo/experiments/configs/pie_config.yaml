@@ -1,0 +1,75 @@
+model:
+  # Must match the Pie server's [[model]] hf_repo (weight sync needs identical
+  # architecture + param names). 1.5B fits now that the actor is FSDP-sharded
+  # across 2 GPUs under torchrun (see launch note at the bottom of this file).
+  path: Qwen/Qwen2.5-Coder-1.5B-Instruct
+  # Set to `eager` to force the fallback used when flash_attn is unavailable.
+  # Set to `auto` (or omit the key) to use flash_attention_2 when installed.
+  attn_implementation: sdpa
+
+actor:
+  lr: 3.0e-6
+  clip_ratio: 0.2
+  entropy_coeff: 0.0
+  ppo_mini_batch_size: 16
+  micro_batch_size_per_gpu: 1
+  max_token_len_per_gpu: 8192
+  master_port: 29512
+  # verl's offload is load-before-step / offload-after-step, so it shrinks the
+  # IDLE footprint, not the optimizer-step PEAK — it can't fix a colocation OOM.
+  # Left off; 0.5B fits without it. (See transformer_impl.py:750-766.)
+  optimizer_offload: false
+  param_offload: false
+  grad_offload: false
+
+rollout:
+  n_samples: 8           # GRPO group size — 8 (was 4) → more MIXED groups (some pass,
+                         # some fail) → fewer zero-advantage steps + cleaner advantages
+  max_tokens: 512        # HumanEval solutions exceed 128
+  temperature: 0.8
+  top_p: 0.95
+  system: "You are a helpful coding assistant. Respond with code only."
+
+pie:
+  uri: ws://127.0.0.1:8080
+  username: rl-trainer
+  grpo_inferlet: grpo@0.1.0
+  # Stage C — weight-sync fan-out degree. Must match the Pie server's
+  # [model.driver] tensor_parallel_size. 1 = one full model per DP replica (the
+  # only path this box supports; TP>1 needs NVLink + the pie-gt sharded-receive
+  # changes — see docs/stage_c_tp_weight_sync.md).
+  tensor_parallel_size: 1
+
+# Topology (Stage B) — un-hardcodes the 2-GPU / same-GPU-IPC assumptions. All
+# optional; the defaults below reproduce the current colocated DP=2 behaviour
+# exactly (world/fsdp follow torchrun, identity device map, cross-GPU IPC off).
+topology:
+  world_size: auto         # auto → launcher WORLD_SIZE; or an int
+  fsdp_size: auto          # auto → world_size (pure ZeRO-3); int < ws → hybrid mesh
+  weight_sync:
+    device_map: identity   # identity → device_idx == rank (same-GPU CUDA-IPC)
+    allow_cross_gpu_ipc: false  # cross-GPU IPC needs P2P/NVLink (this box: CNS)
+
+train:
+  num_steps: 50        # real run — long enough for a held-out trend to clear noise
+  max_prompt_len: 512
+  sync_weights: true     # push policy → rollout engine after each step
+
+# HumanEval (prepared by RL-Heval/data/prepare_humaneval.py — 131 train problems).
+data:
+  humaneval_parquet: recipe/pie_grpo/experiments/data/humaneval_train.parquet
+  problems_per_step: 8   # prompts per GRPO step (× n_samples=4 = 32 generations/step)
+
+# Fixed held-out eval — the clean learning curve (test split, never trained on).
+eval:
+  parquet: recipe/pie_grpo/experiments/data/humaneval_test.parquet
+  n_problems: null       # null = all held-out problems (~26)
+  # MBPP transfer eval — DISJOINT from HumanEval training, ~257 held-out problems
+  # → resolves sub-3% gains the 33-problem heval can't. Prepared once by
+  # PieRL/data/prepare_mbpp.py; comment out mbpp_parquet to disable.
+  mbpp_parquet: recipe/pie_grpo/experiments/data/mbpp_test.parquet
+  mbpp_n_problems: 100   # cap the periodic eval cost (null = all ~257)
+  every_steps: 5         # eval at baseline, then every N steps + final
+  temperature: 0.0       # greedy pass@1; bump to ~0.2 if Pie's sampler rejects 0
+  top_p: 1.0
+  max_workers: 10
