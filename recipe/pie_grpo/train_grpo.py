@@ -20,6 +20,7 @@ Run in Pie's ``vllm`` venv, on the SAME GPU as a live Pie server started with
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 
 import numpy as np
@@ -37,6 +38,17 @@ from recipe.pie_grpo.topology import (
     resolve_fsdp_size,
     resolve_world_size,
 )
+from recipe.pie_grpo.experiments.metrics import RunMetrics
+
+
+@contextlib.contextmanager
+def _nullctx():
+    yield
+
+
+def _phase(rm, name):
+    """Time `name` on the RunMetrics collector, or no-op when rm is None (non-rank-0)."""
+    return rm.phase(name) if rm is not None else _nullctx()
 from verl.protocol import DataProto
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 from verl.utils.model import compute_position_id_with_mask
@@ -367,7 +379,7 @@ def scatter_rollout(dp, *, world_size: int, rank: int, src: int = 0):
 # --------------------------------------------------------------------------- #
 # Loop                                                                         #
 # --------------------------------------------------------------------------- #
-def train(cfg: dict) -> None:
+def train(cfg: dict, metrics_out: str | None = None) -> None:
     # Stage B: topology comes from the (optional) `topology:` config block; defaults
     # reproduce the launcher-driven DP=2 path (world/fsdp = WORLD_SIZE, identity map).
     topo = cfg.get("topology")
@@ -379,6 +391,19 @@ def train(cfg: dict) -> None:
     tp_size = check_tp_supported(cfg.get("pie"))
     is_main = rank == 0
     rollout, actor_cfg = cfg["rollout"], cfg["actor"]
+
+    # Experiment metrics (rank 0 only; None -> no-op everywhere via _phase()).
+    run_metrics = None
+    if is_main and metrics_out:
+        run_metrics = RunMetrics(
+            backend="pie",
+            run_meta={"model": cfg["model"]["path"], "n_gpus": world_size,
+                      "gpu": os.environ.get("PIE_EXP_GPU", "unknown"),
+                      "num_steps": cfg["train"]["num_steps"],
+                      "hyperparams": {"n_samples": rollout["n_samples"],
+                                      "lr": actor_cfg["lr"],
+                                      "temperature": rollout["temperature"]}},
+            out_path=metrics_out)
 
     # Rank 0 drives generation + eval (Pie auto-balances the launches across both
     # DP replicas); EVERY rank builds the FSDP actor, runs the collectives
@@ -427,7 +452,7 @@ def train(cfg: dict) -> None:
                 mbpp_parquet, eval_cfg.get("mbpp_n_problems")
             )
 
-        def run_eval(tag: str) -> float:
+        def run_eval(tag: str):
             acc = evaluate(
                 worker,
                 eval_prompts,
@@ -440,8 +465,9 @@ def train(cfg: dict) -> None:
                 top_p=eval_cfg.get("top_p", 1.0),
             )
             line = f"[eval {tag}] heval pass@1 = {acc:.3f}  (n={len(eval_prompts)})"
+            mbpp_acc = None
             if mbpp_prompts:
-                m = evaluate(
+                mbpp_acc = evaluate(
                     worker,
                     mbpp_prompts,
                     mbpp_gts,
@@ -452,17 +478,22 @@ def train(cfg: dict) -> None:
                     temperature=eval_cfg.get("temperature", 0.0),
                     top_p=eval_cfg.get("top_p", 1.0),
                 )
-                line += f"  |  mbpp pass@1 = {m:.3f}  (n={len(mbpp_prompts)})"
+                line += f"  |  mbpp pass@1 = {mbpp_acc:.3f}  (n={len(mbpp_prompts)})"
             print(line)
-            return acc
+            return acc, mbpp_acc
 
-        run_eval("baseline")  # base-model pass@1 before any training
+        with _phase(run_metrics, "eval"):
+            heval0, mbpp0 = run_eval("baseline")  # base-model pass@1 before training
+        if run_metrics:
+            run_metrics.record_eval(-1, heval0, mbpp0)
 
     # Per-step (train) pass-rate — noisy because each step samples DIFFERENT problems;
     # the held-out eval above is the rigorous curve. run_mean smooths the train noise.
     reward_history: list[float] = []
     every = eval_cfg.get("every_steps", 5)
     for step in range(cfg["train"]["num_steps"]):
+        if run_metrics:
+            run_metrics.start_step()
         # 0-2. rank 0 only: problems → rollout → reward → FULL-batch advantages.
         #      Generation is already parallel (Pie DP=2 auto-balances the launches);
         #      the advantage math is model-free, so rank 0 computes it alone on the
@@ -472,25 +503,30 @@ def train(cfg: dict) -> None:
             prompts, ground_truths = load_humaneval(
                 cfg["data"]["humaneval_parquet"], cfg["data"]["problems_per_step"], step
             )
-            gen = worker.generate(
-                prompts,
-                n_samples=rollout["n_samples"],
-                max_tokens=rollout["max_tokens"],
-                temperature=rollout["temperature"],
-                top_p=rollout["top_p"],
-                system=rollout.get("system"),
-            )
+            with _phase(run_metrics, "gen"):
+                gen = worker.generate(
+                    prompts,
+                    n_samples=rollout["n_samples"],
+                    max_tokens=rollout["max_tokens"],
+                    temperature=rollout["temperature"],
+                    top_p=rollout["top_p"],
+                    system=rollout.get("system"),
+                )
+            if run_metrics:
+                run_metrics.record_gen_tokens(
+                    sum(len(s["tokens"]) for g in gen for s in g["samples"]))
             # pack into a padded DataProto  (Manual #1)
             dp = pack_dataproto(prompts, gen, tokenizer, system=rollout.get("system"))
             rewards = torch.tensor(reward_fn(gen, ground_truths))
             # reward → token-level → group-relative advantage (by uid), full batch.
-            response_mask = dp.batch["response_mask"].float()
-            token_level = _scatter_rewards_to_tokens(rewards, response_mask)
-            uid = dp.non_tensor_batch["uid"]
-            advantages, _ = compute_grpo_outcome_advantage(
-                token_level, response_mask, uid
-            )
-            dp.batch["advantages"] = advantages
+            with _phase(run_metrics, "adv"):
+                response_mask = dp.batch["response_mask"].float()
+                token_level = _scatter_rewards_to_tokens(rewards, response_mask)
+                uid = dp.non_tensor_batch["uid"]
+                advantages, _ = compute_grpo_outcome_advantage(
+                    token_level, response_mask, uid
+                )
+                dp.batch["advantages"] = advantages
         else:
             gen = dp = rewards = advantages = response_mask = None
 
@@ -500,16 +536,18 @@ def train(cfg: dict) -> None:
 
         # 3. old_log_probs on the LOCAL shard — COLLECTIVE (all ranks), scored at the
         #    rollout temperature so the ratio's behaviour policy is the one that sampled.
-        local_dp.batch["old_log_probs"] = actor.compute_log_prob(
-            local_dp, temperature=rollout["temperature"]
-        )
+        with _phase(run_metrics, "logprob"):
+            local_dp.batch["old_log_probs"] = actor.compute_log_prob(
+                local_dp, temperature=rollout["temperature"]
+            )
 
         # 4. one GRPO/PPO optimizer step on the LOCAL shard — COLLECTIVE. Grads
         #    reduce-scatter over WORLD and the engine all-reduces batch_num_tokens, so
         #    the gradient is the true global-token-mean over both shards (Stage A note).
-        metrics = actor.update_actor(
-            local_dp, num_mini_batch=1, temperature=rollout["temperature"]
-        )
+        with _phase(run_metrics, "update"):
+            metrics = actor.update_actor(
+                local_dp, num_mini_batch=1, temperature=rollout["temperature"]
+            )
 
         # 5. push updated policy → live rollout engine. Barrier so rank 0 doesn't
         #    extract mid-step; collective extract on all ranks, each pushes to its own
@@ -518,7 +556,9 @@ def train(cfg: dict) -> None:
         if world_size > 1:
             torch.distributed.barrier()
         if cfg["train"]["sync_weights"]:
-            sync_weights(worker, actor.fsdp_module, device_idx=device_idx_for_rank(topo, rank))
+            with _phase(run_metrics, "weight_sync"):
+                sync_weights(worker, actor.fsdp_module,
+                             device_idx=device_idx_for_rank(topo, rank))
 
         # --- verification readout (rank 0 only) ---
         # reward_std > 0 means the group has signal; adv|mean| > 0 means GRPO
@@ -544,6 +584,8 @@ def train(cfg: dict) -> None:
             rmean = rewards.float().mean().item()
             reward_history.append(rmean)
             run_mean = sum(reward_history) / len(reward_history)  # cumulative pass-rate
+            if run_metrics:
+                run_metrics.record_train(rmean, pg_loss)
             sample_txt = gen[0]["samples"][0]["text"].replace("\n", " ")[:100]
             print(
                 f"[step {step:2d}] reward_mean={rmean:.3f} reward_std={rewards.float().std():.3f} "
@@ -552,7 +594,13 @@ def train(cfg: dict) -> None:
             )
 
             if (step + 1) % every == 0 or step == cfg["train"]["num_steps"] - 1:
-                run_eval(f"step {step}")
+                with _phase(run_metrics, "eval"):
+                    heval_s, mbpp_s = run_eval(f"step {step}")
+                if run_metrics:
+                    run_metrics.record_eval(step, heval_s, mbpp_s)
+
+        if run_metrics:
+            run_metrics.end_step()
 
     # Learning-curve summary: first vs last third of steps (rough — each step uses
     # different problems; a held-out eval set would be the rigorous trend).
@@ -566,14 +614,20 @@ def train(cfg: dict) -> None:
             f"(Δ={last - first:+.3f}, overall {overall:.3f})"
         )
 
+    if run_metrics:
+        run_metrics.record_peak_mem([torch.cuda.max_memory_allocated() / 1e9])
+        run_metrics.finalize()
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="recipe/pie_grpo/config.yaml")
+    ap.add_argument("--metrics-out", default=None,
+                    help="write experiment metrics.json to this path (rank 0)")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    train(cfg)
+    train(cfg, metrics_out=args.metrics_out)
 
 
 if __name__ == "__main__":
